@@ -36,7 +36,6 @@ runs:
         output_file_path: console,tmp_results.sarif
         output_format: cli,sarif
         soft_fail: true                # don't fail the job outright on findings; let SARIF drive it
-      continue-on-error: true
 
     - name: Download checkov-rules.json
       shell: bash
