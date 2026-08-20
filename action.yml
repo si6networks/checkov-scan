@@ -1,0 +1,114 @@
+name: "Checkov Scan Reusable Action by SI6 Networks"
+author: "Fernando Gont <fgont@si6networks.com>"
+description: "Run a Checkov scan and output the results in SARIF format"
+
+inputs:
+  base_url:
+    description: "Default base URL of documentation files"
+    required: false
+    default: "https://github.com/si6networks/checkov-docs/tree/main/rules"
+  directory:
+    description: "Directory to be scanned"
+    required: false
+    default: .
+  framework:
+    description: "Framework to scan"
+    required: false
+  output_file:
+    description: "Output file for results in SARIF format"
+    required: false
+    default: results.sarif
+
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+    - name: Run Checkov
+      id: checkov
+      uses: si6networks/checkov-action@48fbbf887f5d2a14e4fb388602ec36e6d6f966c3 # v1.0
+      with:
+        directory: ${{ inputs.directory }}
+        download_external_modules: true
+        framework: ${{ inputs.framework }}
+        output_file_path: console,tmp_results.sarif
+        output_format: cli,sarif
+        soft_fail: true                # don't fail the job outright on findings; let SARIF drive it
+      continue-on-error: true
+
+    - name: Download checkov-rules.json
+      shell: bash
+      run: |
+        curl -sSL --fail \
+          -o tmp_checkov-rules.json \
+          "https://raw.githubusercontent.com/si6networks/checkov-rules/9a01bf90ddfdc43e66c257a5a1352a406ad7366c/rules/checkov-rules.json"
+
+    - name: Replace placeholder in checkov-rules.json
+      env:
+        BASE_URL: ${{ inputs.base_url }}
+      shell: bash
+      run: |
+        ESCAPED_URL=$(printf '%s' "$BASE_URL" | sed -e 's/[&/\|]/\\&/g')
+        sed -i "s|____BASE_URL____|${ESCAPED_URL}|g" tmp_checkov-rules.json
+
+    - name: Enrich Checkov SARIF with rule help text, help URL, severity, and language
+      shell: python3 {0}
+      env:
+        SARIF_OUT_PATH: ${{ inputs.output_file }}
+      run: |
+        import json, os
+
+        RULES_PATH = "tmp_checkov-rules.json"
+        SARIF_IN = "tmp_results.sarif"
+        SARIF_OUT = os.environ["SARIF_OUT_PATH"]
+
+        out_dir = os.path.dirname(SARIF_OUT)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        with open(RULES_PATH, encoding="utf-8") as f:
+            rules_by_id = {r["rule_id"]: r for r in json.load(f)}
+
+        with open(SARIF_IN, encoding="utf-8") as f:
+            sarif = json.load(f)
+
+        updated_rules = 0
+        updated_results = 0
+        for run in sarif.get("runs", []):
+            for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
+                meta = rules_by_id.get(rule.get("id"))
+                if meta is None:
+                    continue
+                rule["helpUri"] = meta["rule_url"]
+                help_obj = rule.setdefault("help", {})
+                help_obj["text"] = meta["rule_help"]
+                # Always set markdown so GitHub renders a real "here" hyperlink instead
+                # of a bare URL string (GitHub's UI prefers help.markdown over help.text).
+                help_obj["markdown"] = meta.get("rule_help_markdown", meta["rule_help"])
+                props = rule.setdefault("properties", {})
+                if meta.get("rule_score") is not None:
+                    props["security-severity"] = str(meta["rule_score"])
+                if meta.get("rule_severity"):
+                    props["checkov-severity"] = meta["rule_severity"]
+                if meta.get("rule_language"):
+                    props["language"] = meta["rule_language"]
+                updated_rules += 1
+
+            for result in run.get("results", []):
+                meta = rules_by_id.get(result.get("ruleId"))
+                if meta is None or not meta.get("rule_language"):
+                    continue
+                result.setdefault("properties", {})["language"] = meta["rule_language"]
+                updated_results += 1
+
+        with open(SARIF_OUT, "w", encoding="utf-8") as f:
+            json.dump(sarif, f, indent=2)
+        print(f"Enriched {updated_rules} rule definition(s) and {updated_results} result(s) with language.")
+
+    - name: Clean up temporary files
+      if: always()
+      shell: bash
+      run: rm -f tmp_checkov-rules.json tmp_results.sarif
+
